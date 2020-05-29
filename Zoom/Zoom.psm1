@@ -130,7 +130,7 @@ function Invoke-ZoomMethod {
         [int]$RetryTimeoutMilliseconds = 500,
 
         [Parameter(Mandatory = $false)]
-        [int]$RetryCount = 3
+        [int]$RetryCount = 6
     )
 
     Write-Debug "[BEGIN] Invoke-ZoomMethod - $((Get-PSCallStack)[1].Command)"
@@ -166,24 +166,60 @@ function Invoke-ZoomMethod {
         $apiCallInfo += "`n$Body"
     }
 
-
     if ($Method -eq 'Get' -or $pscmdlet.ShouldProcess($apiCallInfo, 'Invoke Zoom method')) {
-
-        Write-Debug "[INVOKE] $apiCallInfo"
-
-        try {
-            $response = Invoke-RestMethod @callParams
-        } catch {
-            throw $_
-        }
 
         $retry = 0
 
+        do {
+            $fail = $false
+
+            try {
+                Write-Debug "[INVOKE] REST Method`n$apiCallInfo"
+                $response = Invoke-RestMethod @callParams
+
+            # This block handles the api calls that do not return errors in the http reponse
+            } catch [System.Net.WebException] {
+                $errMsg = $_.Exception.Message
+
+                switch ($_.Exception.Response.StatusCode) {
+                    'NotFound' {
+                        Write-Warning "Resource inactive or not found - $errMsg"
+                        Write-Warning $apiCallInfo
+                    }
+                    429 {
+                        $fail = $true
+                        Write-Warning "Throttled, retrying in $RetryTimeoutMilliseconds milliseconds..."
+                        Start-Sleep -Milliseconds $RetryTimeoutMilliseconds
+                    }
+                    401 {
+                        $fail = $true
+                        Write-Warning "Unauthorized, retrying..."
+                        Set-ZoomApiAuth
+                        $apiCallInfo.Header = $script:TokenCache.Header
+                    }
+                    default {
+                        Write-Warning "Unhandled exception - $errMsg"
+                        Write-Warning $apiCallInfo
+                    }
+                }
+
+            } catch {
+                Write-Warning "Unhandled exception - $($_.Exception.Message)"
+                Write-Warning $apiCallinfo
+                throw $_
+            }
+
+            $retry++
+        } while ($fail -and ($retry -lt $RetryCount))
+
+        # This block handles the api calls that return the error in the http response
         while ($response.PSObject.Properties.Name -match 'error' -and ($retry -lt $RetryCount)) {
+            $errMsg = $response.error.message
+            $errCode = $response.error.code
 
-            Write-Error -Message "$($response.error.message)`n$apiCallInfo" -ErrorId $response.error.code -Category InvalidOperation
+            Write-Error -Message "$errMsg`n$apiCallInfo" -ErrorId $errCode -Category InvalidOperation
 
-            switch ($response.error.code) {
+            switch ($errCode) {
                 429 {
                     Write-Warning "Throttled, retrying in $RetryTimeoutMilliseconds milliseconds..."
                     Start-Sleep -Milliseconds $RetryTimeoutMilliseconds
@@ -192,6 +228,10 @@ function Invoke-ZoomMethod {
                     Write-Warning "Unauthorized, retrying..."
                     Set-ZoomApiAuth
                     $apiCallInfo.Header = $script:TokenCache.Header
+                }
+                default {
+                    Write-Warning "Unhandled exception - [$errCode] $errMsg"
+                    Write-Warning $apiCallInfo
                 }
             }
 
@@ -334,31 +374,102 @@ function Get-ZoomUser {
         }
     } else {
 
-        $type = switch ($LoginType) {
-            'Facebook' {
-                '0'
-            }
-            'Google' {
-                '1'
-            }
-            'Api' {
-                '99'
-            }
-            'Zoom' {
-                '100'
-            }
-            'Sso' {
-                '101'
-            }
-        }
-
         foreach ($user in $UserId) {
             $endpoint = "https://api.zoom.us/v2/users/$($user)"
 
-            if ($PSBoundParameters.ContainsKey('License')) {
+            if ($PSBoundParameters.ContainsKey('LoginType')) {
+                $type = switch ($LoginType) {
+                    'Facebook' {
+                        '0'
+                    }
+                    'Google' {
+                        '1'
+                    }
+                    'Api' {
+                        '99'
+                    }
+                    'Zoom' {
+                        '100'
+                    }
+                    'Sso' {
+                        '101'
+                    }
+                }
+
                 $endpoint += "?login_type=$($type)"
             }
 
+            Invoke-ZoomMethod -Uri $endpoint
+        }
+    }
+}
+
+function Get-ZoomUserSettings {
+    <#
+    .SYNOPSIS
+    Retrieve a user’s settings.
+
+    .OUTPUTS
+    PSCustomObject
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(
+            Mandatory = $true,
+            Position = 0,
+            ValueFromPipeline = $true,
+            ValueFromPipelineByPropertyName = $true
+        )]
+        [Alias("Id", "Email")]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$UserId,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('Facebook', 'Google', 'Api', 'Zoom', 'Sso')]
+        [string]$LoginType,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('meeting_authentication', 'recording_authentication', IgnoreCase = $false)]
+        [String]$Option
+    )
+
+    begin {
+        if ($PSBoundParameters.ContainsKey('LoginType')) {
+            $type = switch ($LoginType) {
+                'Facebook' {
+                    '0'
+                }
+                'Google' {
+                    '1'
+                }
+                'Api' {
+                    '99'
+                }
+                'Zoom' {
+                    '100'
+                }
+                'Sso' {
+                    '101'
+                }
+            }
+        }
+    }
+
+    process {
+        foreach ($user in $UserId) {
+            $endpoint = "https://api.zoom.us/v2/users/$($user)/settings"
+
+            if ($PSBoundParameters.ContainsKey('LoginType')) {
+                $endpoint += "?login_type=$($type)"
+
+                if ($PSBoundParameters.ContainsKey('Option')) {
+                    $endpoint += "&option=$($Option)"
+                }
+            } elseif ($PSBoundParameters.ContainsKey('Option')) {
+                $endpoint += "?option=$($Option)"
+            }
+
+            Write-Verbose "Getting Zoom settings for $user"
             Invoke-ZoomMethod -Uri $endpoint
         }
     }
@@ -369,7 +480,7 @@ function Set-ZoomUser {
     .SYNOPSIS
     Update user info on Zoom via user ID.
 
-    .PARAMETER Id
+    .PARAMETER UserId
     Zoom user to update.
 
     .PARAMETER FirstName
@@ -613,6 +724,230 @@ function Set-ZoomUser {
                 Write-Verbose "Update Zoom user picture for $UserId"
                 Invoke-ZoomMethod -Uri "$endpoint/picture" -Body $requestBody -Method Post -ContentType "multipart/form-data; boundary=`"$boundary`""
             }
+        }
+    }
+}
+
+function Set-ZoomUserSettings {
+    <#
+    .SYNOPSIS
+    Update a user's settings.
+
+    .PARAMETER UserId
+    Zoom user to update.
+
+    .PARAMETER LocalRecording
+    Local recording.
+
+    .PARAMETER CloudRecording
+    Cloud recording.
+
+    .PARAMETER RecordSpeakerView
+    Record the active speaker view.
+
+    .PARAMETER RecordGalleryView
+    Record the gallery view.
+
+    .PARAMETER RecordAudioFile
+    Record an audio only file.
+
+    .PARAMETER SaveChatText
+    Save chat text from the meeting.
+
+    .PARAMETER ShowTimestamp
+    Show timestamp on video.
+
+    .PARAMETER RecordingAudioTranscript
+    Audio transcript.
+
+    .PARAMETER AutoRecording
+    Automatic recording:
+    local - Record on local.
+    cloud - Record on cloud.
+    none - Disabled.
+
+    .PARAMETER HostPauseStopRecording
+    Host can pause/stop the auto recording in the cloud.
+
+    .PARAMETER AutoDeleteCmr
+    Auto delete cloud recordings.
+
+    .PARAMETER AutoDeleteCmrDays
+    A specified number of days of auto delete cloud recordings. (1 - 60)
+
+    .PARAMETER EnterExitChime
+    Enable enter/exit chime.
+
+    .PARAMETER EnterExitChimeType
+    Enter/exit chime type. All (0) means heard by all including host and attendees, HostOnly (1) means heard by host only.
+
+    .PARAMETER DisableFeedback
+    Disable feedback.
+
+    .PARAMETER LargeMeeting
+    Enable [large meeting](https://support.zoom.us/hc/en-us/articles/201362823-What-is-a-Large-Meeting-) feature for the user.
+
+    .PARAMETER Webinar
+    Enable Webinar feature for the user.
+
+    .PARAMETER ZoomPhone
+    Zoom phone feature.
+
+    .EXAMPLE
+    Get-ZoomUserSettings -Id user@company.com | Set-ZoomUserSettings -LocalRecording $true
+    Enable local recording on user@company.com's account.
+
+    .NOTES
+    https://marketplace.zoom.us/docs/api-reference/zoom-api/users/usersettingsupdate
+
+    .OUTPUTS
+    PSCustomObject
+    #>
+    [CmdletBinding(
+        SupportsShouldProcess,
+        DefaultParameterSetName = 'NoPicture'
+    )]
+    param(
+        [Parameter(
+            Mandatory = $true,
+            Position = 0,
+            ValueFromPipeline = $true,
+            ValueFromPipelineByPropertyName = $true
+        )]
+        [Alias("Email", "Id")]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$UserId,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$LocalRecording,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$CloudRecording,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$RecordSpeakerView,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$RecordGalleryView,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$RecordAudioFile,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$SaveChatText,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$ShowTimestamp,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$RecordingAudioTranscript,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('local', 'cloud', 'none', IgnoreCase = $false)]
+        [string]$AutoRecording,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$HostPauseStopRecording,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$AutoDeleteCmr,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$AutoDeleteCmrDays,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('host', 'all', 'none', IgnoreCase = $false)]
+        [string]$EntryExitChime,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('host', 'all', 'none', IgnoreCase = $false)]
+        [string]$Feedback,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$LargeMeeting,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$Webinar,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$ZoomPhone
+    )
+
+    process {
+        foreach ($user in $UserId) {
+            $endpoint = "https://api.zoom.us/v2/users/$user/settings"
+
+            $body = @{
+                'schedule_meeting' = @{}
+                'in_meeting' = @{}
+                'email_notification' = @{}
+                'recording' = @{}
+                'telephony' = @{}
+                'integration' = @{}
+                'feature' = @{}
+                'tsp' = @{}
+               }
+
+            # in_meeting
+            if ($PSBoundParameters.ContainsKey('EntryExitChime')) {
+                $body['in_meeting'].Add('entry_exit_chime', $EntryExitChime)
+            }
+            if ($PSBoundParameters.ContainsKey('Feedback')) {
+                $body['in_meeting'].Add('feedback', $Feedback)
+            }
+
+            # recording
+            if ($PSBoundParameters.ContainsKey('LocalRecording')) {
+                $body['recording'].Add('local_recording', $LocalRecording)
+            }
+            if ($PSBoundParameters.ContainsKey('CloudRecording')) {
+                $body['recording'].Add('cloud_recording', $CloudRecording)
+            }
+            if ($PSBoundParameters.ContainsKey('RecordSpeakerView')) {
+                $body['recording'].Add('record_speaker_view', $RecordSpeakerView)
+            }
+            if ($PSBoundParameters.ContainsKey('RecordGalleryView')) {
+                $body['recording'].Add('record_gallery_view', $RecordGalleryView)
+            }
+            if ($PSBoundParameters.ContainsKey('RecordAudioFile')) {
+                $body['recording'].Add('record_audio_file', $RecordAudioFile)
+            }
+            if ($PSBoundParameters.ContainsKey('SaveChatText')) {
+                $body['recording'].Add('save_chat_text', $SaveChatText)
+            }
+            if ($PSBoundParameters.ContainsKey('ShowTimestamp')) {
+                $body['recording'].Add('show_timestamp', $ShowTimestamp)
+            }
+            if ($PSBoundParameters.ContainsKey('RecordingAudioTranscript')) {
+                $body['recording'].Add('recording_audio_transcript', $RecordingAudioTranscript)
+            }
+            if ($PSBoundParameters.ContainsKey('AutoRecording')) {
+                $body['recording'].Add('auto_recording', $AutoRecording)
+            }
+            if ($PSBoundParameters.ContainsKey('HostPauseStopRecording')) {
+                $body['recording'].Add('host_pause_stop_recording', $HostPauseStopRecording)
+            }
+            if ($PSBoundParameters.ContainsKey('AutoDeleteCmr')) {
+                $body['recording'].Add('auto_delete_cmr', $AutoDeleteCmr)
+            }
+            if ($PSBoundParameters.ContainsKey('AutoDeleteCmrDays')) {
+                $body['recording'].Add('auto_delete_cmr_days', $AutoDeleteCmrDays)
+            }
+
+            # features
+            if ($PSBoundParameters.ContainsKey('LargeMeeting')) {
+                $body['feature'].Add('large_meeting', $LargeMeeting)
+            }
+            if ($PSBoundParameters.ContainsKey('Webinar')) {
+                $body['feature'].Add('webinar', $Webinar)
+            }
+            if ($PSBoundParameters.ContainsKey('ZoomPhone')) {
+                $body['feature'].Add('zoom_phone', $ZoomPhone)
+            }
+
+            Write-Verbose "Update settings for user $user"
+            $body = $body | ConvertTo-Json
+            Invoke-ZoomMethod -Uri $endpoint -Body $body -Method Patch
         }
     }
 }
@@ -1359,25 +1694,28 @@ function Get-ZoomPhoneUser {
     )
 
     if (@('All', 'List') -contains $PSCmdlet.ParameterSetName) {
-        $endpoint = 'https://api.zoom.us/v2/phone/users?'
 
-        $pageSize = 300
-        $endpoint += "&page_size=$($pageSize)"
+        $users = @()
+        $nextPage = $null
+        $baseUri = 'https://api.zoom.us/v2/phone/users?'
 
-        $result = Invoke-ZoomMethod -Uri $endpoint
+        $pageSize = 100
+        $baseUri += "page_size=$($pageSize)"
 
-        $users = $result.users
-
-        if ($result.page_count -gt 1) {
-            Write-Verbose "There are $($result.page_count) pages of phone users"
-            for ($page = 2; $page -le $result.page_count; $page++) {
-                $pagedEndpoint = "$endpoint&page_number=$page"
-
-                $pageResult = Invoke-ZoomMethod -Uri $pagedEndpoint
-
-                $users += $pageResult.users
+        do {
+            if (-not $nextPage) {
+                $result = Invoke-ZoomMethod -Uri $baseUri
+            } else {
+                $endpoint = $baseUri + "&next_page_token=$($nextPage)"
+                $result = Invoke-ZoomMethod -Uri $endpoint
             }
-        }
+
+            $nextPage = $result.next_page_token
+
+            $users += $result.users
+        } while ($nextPage)
+
+        Write-Verbose "Zoom phone users retrieved: $($users.Count)"
 
         if ($PSCmdlet.ParameterSetName -eq 'List') {
             return $users
@@ -1397,18 +1735,50 @@ function Get-ZoomPhoneUser {
     } else {
         foreach ($user in $UserId) {
             $endpoint = "https://api.zoom.us/v2/phone/users/$($user)"
+            Invoke-ZoomMethod -Uri $endpoint
+        }
+    }
+}
 
-            try {
-                Invoke-ZoomMethod -Uri $endpoint
-            } catch [System.Net.WebException] {
-                if ($_.Exception.Response.StatusCode -eq 'NotFound') {
-                    Write-Warning "Phone user $user does not exist."
-                } else {
-                    Write-Warning "Web Exception: $($_.Exception.Message)"
-                }
-            } catch {
-                $_
-            }
+function Get-ZoomPhoneUserSettings {
+    <#
+    .SYNOPSIS
+    Gets Zoom phone user settings.
+
+    .PARAMETER UserId
+    Gets Zoom phone user settings by their Zoom Id or Email. Will accept an array of Id's and Emails.
+
+    .EXAMPLE
+    Get-ZoomPhoneUser
+    Returns all zoom phone users.
+
+    .EXAMPLE
+    Get-ZoomPhoneUser -Email user@company.com
+    Searches for and returns specified phone user if found.
+
+    .NOTES
+    https://marketplace.zoom.us/docs/api-reference/zoom-api/phone/phoneusersettings
+
+    .OUTPUTS
+    PSCustomObject
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(
+            Mandatory = $true,
+            Position = 0,
+            ValueFromPipeline = $true,
+            ValueFromPipelineByPropertyName = $true
+        )]
+        [Alias("Id", "Email")]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$UserId
+    )
+
+    process {
+        foreach ($user in $UserId) {
+            $endpoint = "https://api.zoom.us/v2/phone/users/$($user)/settings"
+            Invoke-ZoomMethod -Uri $endpoint
         }
     }
 }
@@ -1558,18 +1928,7 @@ function Get-ZoomPhoneNumber {
     } else {
         foreach ($number in $Id) {
             $endpoint = "https://api.zoom.us/v2/phone/numbers/$($number)"
-
-            try {
-                Invoke-ZoomMethod -Uri $endpoint
-            } catch [System.Net.WebException] {
-                if ($_.Exception.Response.StatusCode -eq 'NotFound') {
-                    Write-Warning "Phone number $number does not exist."
-                } else {
-                    Write-Warning "Web Exception: $($_.Exception.Message)"
-                }
-            } catch {
-                $_
-            }
+            Invoke-ZoomMethod -Uri $endpoint
         }
     }
 }
